@@ -168,8 +168,8 @@ impl Clone for Transport<'_> {
 	}
 }
 
-impl<T: AsRef<str>> From<T> for Transport {
-	fn from(t: T) -> Self {
+impl<'a> From<&'a str> for Transport<'a> {
+	fn from(t: &'a str) -> Self {
 		Self { uri: t, client: None }
 	}
 }
