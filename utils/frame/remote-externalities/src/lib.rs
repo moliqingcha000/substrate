@@ -120,13 +120,22 @@ use sp_runtime::traits::Block as BlockT;
 type KeyPair = (StorageKey, StorageData);
 
 const LOG_TARGET: &str = "remote-ext";
-const TARGET: &str = "http://localhost:9933";
+const DEFAULT_TARGET: &str = "http://localhost:9998";
 
 jsonrpsee_proc_macros::rpc_client_api! {
 	RpcApi<B: BlockT> {
-		#[rpc(method = "state_getPairs", positional_params)]
+		#[rpc(method = "state_getPairs", positional_params, positional_params)]
 		fn storage_pairs(prefix: StorageKey, hash: Option<B::Hash>) -> Vec<(StorageKey, StorageData)>;
-		#[rpc(method = "chain_getFinalizedHead")]
+		#[rpc(method = "state_getStorage", positional_params)]
+		fn get_storage(prefix: StorageKey, hash: Option<B::Hash>) -> StorageData;
+		#[rpc(method = "state_getKeysPaged", positional_params)]
+		fn get_keys_paged(
+			prefix: Option<StorageKey>,
+			count: u32,
+			start_key: Option<StorageKey>,
+			hash: Option<B::Hash>,
+		) -> Vec<StorageKey>;
+		#[rpc(method = "chain_getFinalizedHead", positional_params)]
 		fn finalized_head() -> B::Hash;
 	}
 }
@@ -166,7 +175,12 @@ pub struct OnlineConfig<B: BlockT> {
 
 impl<B: BlockT> Default for OnlineConfig<B> {
 	fn default() -> Self {
-		Self { uri: TARGET.to_owned(), at: None, state_snapshot: None, modules: Default::default() }
+		Self {
+			uri: DEFAULT_TARGET.to_owned(),
+			at: None,
+			state_snapshot: None,
+			modules: Default::default(),
+		}
 	}
 }
 
@@ -239,17 +253,96 @@ impl<B: BlockT> Builder<B> {
 		})
 	}
 
+	/// Get all the keys at `prefix` at `hash` using the paged, safe RPC methods.
+	async fn get_keys_paged(
+		&self,
+		prefix: StorageKey,
+		hash: B::Hash,
+	) -> Result<Vec<StorageKey>, &'static str> {
+		const PAGE: u32 = 512;
+		let mut last_key: Option<StorageKey> = None;
+		let mut all_keys: Vec<StorageKey> = vec![];
+		let keys = loop {
+			let page = RpcApi::<B>::get_keys_paged(
+				&self.as_online().rpc(),
+				Some(prefix.clone()),
+				PAGE,
+				last_key.clone(),
+				Some(hash),
+			)
+			.await
+			.map_err(|e| {
+				error!(target: LOG_TARGET, "Error = {:?}", e);
+				"rpc get_keys failed"
+			})?;
+			all_keys.extend(page.clone());
+			if page.len() < (PAGE as usize) {
+				debug!(target: LOG_TARGET, "last page received: {}", page.len());
+				break all_keys;
+			} else {
+				let new_last_key =
+					all_keys.last().expect("all_keys is populated; has .last(); qed");
+				debug!(
+					target: LOG_TARGET,
+					"new total = {}, full page received: {:?}",
+					all_keys.len(),
+					HexDisplay::from(new_last_key)
+				);
+				last_key = Some(new_last_key.clone());
+			}
+		};
+
+		Ok(keys)
+	}
+
+	/// Synonym of `rpc_get_pairs_unsafe` that uses paged queries to first get the keys, and then
+	/// map them to values one by one.
+	///
+	/// This can work with public nodes. But, expect it to be darn slow.
+	async fn rpc_get_pairs_paged(
+		&self,
+		prefix: StorageKey,
+		at: B::Hash,
+	) -> Result<Vec<KeyPair>, &'static str> {
+		let keys = self.get_keys_paged(prefix, at).await?;
+		let keys_count = keys.len();
+		info!(target: LOG_TARGET, "Querying a total of {} keys", keys.len());
+
+		let mut key_values: Vec<KeyPair> = vec![];
+		for key in keys {
+			let value = RpcApi::<B>::get_storage(&self.as_online().rpc(), key.clone(), Some(at))
+				.await
+				.map_err(|e| {
+					error!(target: LOG_TARGET, "Error = {:?}", e);
+					"rpc get_storage failed"
+				})?;
+			key_values.push((key, value));
+			if key_values.len() % 1000 == 0 {
+				let ratio: f64 = key_values.len() as f64 / keys_count as f64;
+				debug!(
+					target: LOG_TARGET,
+					"progress = {:.2} [{} / {}]",
+					ratio,
+					key_values.len(),
+					keys_count,
+				);
+			}
+		}
+
+		Ok(key_values)
+	}
+
 	/// Relay the request to `state_getPairs` rpc endpoint.
 	///
 	/// Note that this is an unsafe RPC.
-	async fn rpc_get_pairs(
+	async fn rpc_get_pairs_unsafe(
 		&self,
 		prefix: StorageKey,
 		at: B::Hash,
 	) -> Result<Vec<KeyPair>, &'static str> {
 		trace!(target: LOG_TARGET, "rpc: storage_pairs: {:?} / {:?}", prefix, at);
 		RpcApi::<B>::storage_pairs(&self.as_online().rpc(), prefix, Some(at)).await.map_err(|e| {
-			error!("Error = {:?}", e);
+			error!(target: LOG_TARGET, "Error = {:?}", e);
 			"rpc storage_pairs failed"
 		})
 	}
@@ -285,7 +378,7 @@ impl<B: BlockT> Builder<B> {
 			let mut filtered_kv = vec![];
 			for f in config.modules.iter() {
 				let hashed_prefix = StorageKey(twox_128(f.as_bytes()).to_vec());
-				let module_kv = self.rpc_get_pairs(hashed_prefix.clone(), at).await?;
+				let module_kv = self.rpc_get_pairs_paged(hashed_prefix.clone(), at).await?;
 				info!(
 					target: LOG_TARGET,
 					"downloaded data for module {} (count: {} / prefix: {:?}).",
@@ -298,7 +391,7 @@ impl<B: BlockT> Builder<B> {
 			filtered_kv
 		} else {
 			info!(target: LOG_TARGET, "downloading data for all modules.");
-			self.rpc_get_pairs(StorageKey(vec![]), at).await?.into_iter().collect::<Vec<_>>()
+			self.rpc_get_pairs_paged(StorageKey(vec![]), at).await?.into_iter().collect::<Vec<_>>()
 		};
 
 		Ok(keys_and_values)
@@ -395,7 +488,7 @@ mod tests {
 		init_logger();
 		Builder::<Block>::new()
 			.mode(Mode::Offline(OfflineConfig {
-				state_snapshot: SnapshotConfig { path: "test_data/proxy_test".into() },
+				state_snapshot: SnapshotConfig::new("test_data/proxy_test"),
 			}))
 			.build()
 			.await
@@ -427,19 +520,15 @@ mod remote_tests {
 		init_logger();
 		Builder::<Block>::new()
 			.mode(Mode::Online(OnlineConfig {
-				state_snapshot: Some(SnapshotConfig {
-					name: "test_snapshot_to_remove.bin".into(),
-					..Default::default()
-				}),
+				state_snapshot: Some(SnapshotConfig::new("test_snapshot_to_remove.bin")),
 				..Default::default()
 			}))
 			.build()
 			.await
 			.expect("Can't reach the remote node. Is it running?")
-			.unwrap()
 			.execute_with(|| {});
 
-		let to_delete = std::fs::read_dir(SnapshotConfig::default().directory)
+		let to_delete = std::fs::read_dir(SnapshotConfig::default().path)
 			.unwrap()
 			.into_iter()
 			.map(|d| d.unwrap())
@@ -455,6 +544,16 @@ mod remote_tests {
 
 	#[tokio::test]
 	async fn can_build_all() {
+		init_logger();
+		Builder::<Block>::new()
+			.build()
+			.await
+			.expect("Can't reach the remote node. Is it running?")
+			.execute_with(|| {});
+	}
+
+	#[tokio::test]
+	async fn paged_and_unsafe_are_equal() {
 		init_logger();
 		Builder::<Block>::new()
 			.build()

@@ -184,7 +184,7 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Mine a new solution as a call. Performs all checks.
-	fn mine_checked_call() -> Result<(Call<T>, ElectionScore), MinerError> {
+	pub fn mine_checked_call() -> Result<(Call<T>, ElectionScore), MinerError> {
 		let iters = Self::get_balancing_iters();
 		// get the solution, with a load of checks to ensure if submitted, IT IS ABSOLUTELY VALID.
 		let (raw_solution, witness) = Self::mine_and_check(iters)?;
@@ -220,7 +220,7 @@ impl<T: Config> Pallet<T> {
 	// Performance: note that it internally clones the provided solution.
 	fn basic_checks(raw_solution: &RawSolution<CompactOf<T>>, solution_type: &str) -> Result<(), MinerError> {
 		Self::unsigned_pre_dispatch_checks(raw_solution).map_err(|err| {
-			log!(warn, "pre-dispatch checks fialed for {} solution: {:?}", solution_type, err);
+			log!(warn, "pre-dispatch checks failed for {} solution: {:?}", solution_type, err);
 			MinerError::PreDispatchChecksFailed
 		})?;
 

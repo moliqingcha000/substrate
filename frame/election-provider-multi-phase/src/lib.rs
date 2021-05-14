@@ -935,7 +935,7 @@ impl<T: Config> Pallet<T> {
 	///
 	/// Returns `Ok(snapshot_weight)` if success, where `snapshot_weight` is the weight that
 	/// needs to recorded for the creation of snapshot.
-	pub(crate) fn on_initialize_open_signed() -> Result<Weight, ElectionError> {
+	pub fn on_initialize_open_signed() -> Result<Weight, ElectionError> {
 		let weight = Self::create_snapshot()?;
 		<CurrentPhase<T>>::put(Phase::Signed);
 		Self::deposit_event(Event::SignedPhaseStarted(Self::round()));
@@ -948,7 +948,7 @@ impl<T: Config> Pallet<T> {
 	///
 	/// Returns `Ok(snapshot_weight)` if success, where `snapshot_weight` is the weight that
 	/// needs to recorded for the creation of snapshot.
-	pub(crate) fn on_initialize_open_unsigned(
+	pub fn on_initialize_open_unsigned(
 		need_snapshot: bool,
 		enabled: bool,
 		now: T::BlockNumber,
@@ -973,7 +973,7 @@ impl<T: Config> Pallet<T> {
 	/// 3. [`DesiredTargets`]
 	///
 	/// Returns `Ok(consumed_weight)` if operation is okay.
-	pub(crate) fn create_snapshot() -> Result<Weight, ElectionError> {
+	pub fn create_snapshot() -> Result<Weight, ElectionError> {
 		let target_limit = <CompactTargetIndexOf<T>>::max_value().saturated_into::<usize>();
 		let voter_limit = <CompactVoterIndexOf<T>>::max_value().saturated_into::<usize>();
 
@@ -1001,14 +1001,14 @@ impl<T: Config> Pallet<T> {
 	}
 
 	/// Kill everything created by [`Pallet::create_snapshot`].
-	pub(crate) fn kill_snapshot() {
+	pub fn kill_snapshot() {
 		<Snapshot<T>>::kill();
 		<SnapshotMetadata<T>>::kill();
 		<DesiredTargets<T>>::kill();
 	}
 
 	/// Checks the feasibility of a solution.
-	fn feasibility_check(
+	pub fn feasibility_check(
 		solution: RawSolution<CompactOf<T>>,
 		compute: ElectionCompute,
 	) -> Result<ReadySolution<T::AccountId>, FeasibilityError> {
