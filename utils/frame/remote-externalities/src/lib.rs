@@ -113,19 +113,16 @@ use sp_core::{
 	storage::{StorageKey, StorageData},
 };
 use codec::{Encode, Decode};
-use jsonrpsee_http_client::{HttpClient, HttpClientBuilder};
-
 use sp_runtime::traits::Block as BlockT;
+use jsonrpsee_ws_client::{WsClientBuilder, WsClient};
 
 type KeyPair = (StorageKey, StorageData);
 
 const LOG_TARGET: &str = "remote-ext";
-const DEFAULT_TARGET: &str = "http://localhost:9998";
+const DEFAULT_TARGET: &str = "wss://rpc.polkadot.io";
 
 jsonrpsee_proc_macros::rpc_client_api! {
 	RpcApi<B: BlockT> {
-		#[rpc(method = "state_getPairs", positional_params, positional_params)]
-		fn storage_pairs(prefix: StorageKey, hash: Option<B::Hash>) -> Vec<(StorageKey, StorageData)>;
 		#[rpc(method = "state_getStorage", positional_params)]
 		fn get_storage(prefix: StorageKey, hash: Option<B::Hash>) -> StorageData;
 		#[rpc(method = "state_getKeysPaged", positional_params)]
@@ -142,9 +139,9 @@ jsonrpsee_proc_macros::rpc_client_api! {
 
 /// The execution mode.
 #[derive(Clone)]
-pub enum Mode<B: BlockT> {
+pub enum Mode<'a, B: BlockT> {
 	/// Online.
-	Online(OnlineConfig<B>),
+	Online(OnlineConfig<'a, B>),
 	/// Offline. Uses a state snapshot file and needs not any client config.
 	Offline(OfflineConfig),
 }
@@ -158,37 +155,49 @@ pub struct OfflineConfig {
 	pub state_snapshot: SnapshotConfig,
 }
 
+/// Description of the transport protocol
+#[derive(Debug)]
+pub struct Transport<'a> {
+	uri: &'a str,
+	client: Option<WsClient>,
+}
+
+impl Clone for Transport<'_> {
+	fn clone(&self) -> Self {
+		Self { uri: self.uri, client: None }
+	}
+}
+
 /// Configuration of the online execution.
 ///
 /// A state snapshot config may be present and will be written to in that case.
 #[derive(Clone)]
-pub struct OnlineConfig<B: BlockT> {
-	/// The HTTP uri to use.
-	pub uri: String,
+pub struct OnlineConfig<'a, B: BlockT> {
 	/// The block number at which to connect. Will be latest finalized head if not provided.
 	pub at: Option<B::Hash>,
 	/// An optional state snapshot file to WRITE to, not for reading. Not written if set to `None`.
 	pub state_snapshot: Option<SnapshotConfig>,
 	/// The modules to scrape. If empty, entire chain state will be scraped.
-	pub modules: Vec<String>,
+	pub modules: Vec<&'a str>,
+	/// Transport config.
+	pub transport: Transport<'a>,
 }
 
-impl<B: BlockT> Default for OnlineConfig<B> {
+impl<B: BlockT> Default for OnlineConfig<'_, B> {
 	fn default() -> Self {
 		Self {
-			uri: DEFAULT_TARGET.to_owned(),
+			transport: Transport { uri: DEFAULT_TARGET, client: None },
 			at: None,
 			state_snapshot: None,
-			modules: Default::default(),
+			modules: vec![],
 		}
 	}
 }
 
-impl<B: BlockT> OnlineConfig<B> {
-	/// Return a new http rpc client.
-	fn rpc(&self) -> HttpClient {
-		HttpClientBuilder::default().max_request_body_size(u32::MAX).build(&self.uri)
-			.expect("valid HTTP url; qed")
+impl<B: BlockT> OnlineConfig<'_, B> {
+	/// Return the rpc client, regardless of the transport type.
+	fn rpc_client(&self) -> &WsClient {
+		self.transport.client.as_ref().expect("ws client must have been initialized by now; qed.")
 	}
 }
 
@@ -212,30 +221,27 @@ impl Default for SnapshotConfig {
 }
 
 /// Builder for remote-externalities.
-pub struct Builder<B: BlockT> {
+pub struct Builder<'a, B: BlockT> {
 	inject: Vec<KeyPair>,
-	mode: Mode<B>,
+	mode: Mode<'a, B>,
 }
 
-impl<B: BlockT> Default for Builder<B> {
+impl<B: BlockT> Default for Builder<'_, B> {
 	fn default() -> Self {
-		Self {
-			inject: Default::default(),
-			mode: Mode::Online(OnlineConfig::default()),
-		}
+		Self { inject: Default::default(), mode: Mode::Online(OnlineConfig::default()) }
 	}
 }
 
 // Mode methods
-impl<B: BlockT> Builder<B> {
-	fn as_online(&self) -> &OnlineConfig<B> {
+impl<'a, B: BlockT> Builder<'a, B> {
+	fn as_online(&self) -> &OnlineConfig<'a, B> {
 		match &self.mode {
 			Mode::Online(config) => &config,
 			_ => panic!("Unexpected mode: Online"),
 		}
 	}
 
-	fn as_online_mut(&mut self) -> &mut OnlineConfig<B> {
+	fn as_online_mut(&mut self) -> &mut OnlineConfig<'a, B> {
 		match &mut self.mode {
 			Mode::Online(config) => config,
 			_ => panic!("Unexpected mode: Online"),
@@ -244,10 +250,10 @@ impl<B: BlockT> Builder<B> {
 }
 
 // RPC methods
-impl<B: BlockT> Builder<B> {
+impl<B: BlockT> Builder<'_, B> {
 	async fn rpc_get_head(&self) -> Result<B::Hash, &'static str> {
 		trace!(target: LOG_TARGET, "rpc: finalized_head");
-		RpcApi::<B>::finalized_head(&self.as_online().rpc()).await.map_err(|e| {
+		RpcApi::<B>::finalized_head(self.as_online().rpc_client()).await.map_err(|e| {
 			error!("Error = {:?}", e);
 			"rpc finalized_head failed."
 		})
@@ -264,7 +270,7 @@ impl<B: BlockT> Builder<B> {
 		let mut all_keys: Vec<StorageKey> = vec![];
 		let keys = loop {
 			let page = RpcApi::<B>::get_keys_paged(
-				&self.as_online().rpc(),
+				self.as_online().rpc_client(),
 				Some(prefix.clone()),
 				PAGE,
 				last_key.clone(),
@@ -276,6 +282,7 @@ impl<B: BlockT> Builder<B> {
 				"rpc get_keys failed"
 			})?;
 			all_keys.extend(page.clone());
+
 			if page.len() < (PAGE as usize) {
 				debug!(target: LOG_TARGET, "last page received: {}", page.len());
 				break all_keys;
@@ -299,7 +306,7 @@ impl<B: BlockT> Builder<B> {
 	/// map them to values one by one.
 	///
 	/// This can work with public nodes. But, expect it to be darn slow.
-	async fn rpc_get_pairs_paged(
+	pub(crate) async fn rpc_get_pairs_paged(
 		&self,
 		prefix: StorageKey,
 		at: B::Hash,
@@ -310,12 +317,13 @@ impl<B: BlockT> Builder<B> {
 
 		let mut key_values: Vec<KeyPair> = vec![];
 		for key in keys {
-			let value = RpcApi::<B>::get_storage(&self.as_online().rpc(), key.clone(), Some(at))
-				.await
-				.map_err(|e| {
-					error!(target: LOG_TARGET, "Error = {:?}", e);
-					"rpc get_storage failed"
-				})?;
+			let value =
+				RpcApi::<B>::get_storage(self.as_online().rpc_client(), key.clone(), Some(at))
+					.await
+					.map_err(|e| {
+						error!(target: LOG_TARGET, "Error = {:?}", e);
+						"rpc get_storage failed"
+					})?;
 			key_values.push((key, value));
 			if key_values.len() % 1000 == 0 {
 				let ratio: f64 = key_values.len() as f64 / keys_count as f64;
@@ -331,25 +339,10 @@ impl<B: BlockT> Builder<B> {
 
 		Ok(key_values)
 	}
-
-	/// Relay the request to `state_getPairs` rpc endpoint.
-	///
-	/// Note that this is an unsafe RPC.
-	async fn rpc_get_pairs_unsafe(
-		&self,
-		prefix: StorageKey,
-		at: B::Hash,
-	) -> Result<Vec<KeyPair>, &'static str> {
-		trace!(target: LOG_TARGET, "rpc: storage_pairs: {:?} / {:?}", prefix, at);
-		RpcApi::<B>::storage_pairs(&self.as_online().rpc(), prefix, Some(at)).await.map_err(|e| {
-			error!(target: LOG_TARGET, "Error = {:?}", e);
-			"rpc storage_pairs failed"
-		})
-	}
 }
 
 // Internal methods
-impl<B: BlockT> Builder<B> {
+impl<B: BlockT> Builder<'_, B> {
 	/// Save the given data as state snapshot.
 	fn save_state_snapshot(&self, data: &[KeyPair], path: &Path) -> Result<(), &'static str> {
 		info!(target: LOG_TARGET, "writing to state snapshot file {:?}", path);
@@ -372,7 +365,7 @@ impl<B: BlockT> Builder<B> {
 			.at
 			.expect("online config must be initialized by this point; qed.")
 			.clone();
-		info!(target: LOG_TARGET, "scraping keypairs from remote node {} @ {:?}", config.uri, at);
+		info!(target: LOG_TARGET, "scraping keypairs from remote @ {:?}", at);
 
 		let keys_and_values = if config.modules.len() > 0 {
 			let mut filtered_kv = vec![];
@@ -391,14 +384,24 @@ impl<B: BlockT> Builder<B> {
 			filtered_kv
 		} else {
 			info!(target: LOG_TARGET, "downloading data for all modules.");
-			self.rpc_get_pairs_paged(StorageKey(vec![]), at).await?.into_iter().collect::<Vec<_>>()
+			self.rpc_get_pairs_paged(StorageKey(vec![]), at).await?
 		};
 
 		Ok(keys_and_values)
 	}
 
-	async fn init_remote_client(&mut self) -> Result<(), &'static str> {
-		info!(target: LOG_TARGET, "initializing remote client to {:?}", self.as_online().uri);
+	pub(crate) async fn init_remote_client(&mut self) -> Result<(), &'static str> {
+		let mut online = self.as_online_mut();
+		info!(target: LOG_TARGET, "initializing remote client to {:?}", online.transport.uri);
+
+		// first, initialize the ws client.
+		let ws_client = WsClientBuilder::default()
+			.max_request_body_size(u32::MAX)
+			.build(online.transport.uri)
+			.await
+			.map_err(|_| "failed to build ws client")?;
+		online.transport.client = Some(ws_client);
+
 		if self.as_online().at.is_none() {
 			let at = self.rpc_get_head().await?;
 			self.as_online_mut().at = Some(at);
@@ -406,7 +409,7 @@ impl<B: BlockT> Builder<B> {
 		Ok(())
 	}
 
-	async fn pre_build(mut self) -> Result<Vec<KeyPair>, &'static str> {
+	pub(crate) async fn pre_build(mut self) -> Result<Vec<KeyPair>, &'static str> {
 		let mut base_kv = match self.mode.clone() {
 			Mode::Offline(config) => self.load_state_snapshot(&config.state_snapshot.path)?,
 			Mode::Online(config) => {
@@ -430,7 +433,7 @@ impl<B: BlockT> Builder<B> {
 }
 
 // Public methods
-impl<B: BlockT> Builder<B> {
+impl<'a, B: BlockT> Builder<'a, B> {
 	/// Create a new builder.
 	pub fn new() -> Self {
 		Default::default()
@@ -445,7 +448,7 @@ impl<B: BlockT> Builder<B> {
 	}
 
 	/// Configure a state snapshot to be used.
-	pub fn mode(mut self, mode: Mode<B>) -> Self {
+	pub fn mode(mut self, mode: Mode<'a, B>) -> Self {
 		self.mode = mode;
 		self
 	}
@@ -504,9 +507,9 @@ mod remote_tests {
 	#[tokio::test]
 	async fn can_build_one_pallet() {
 		init_logger();
-		Builder::<Block>::new()
+		Builder::<'_, Block>::new()
 			.mode(Mode::Online(OnlineConfig {
-				modules: vec!["Proxy".into()],
+				modules: vec!["Proxy"],
 				..Default::default()
 			}))
 			.build()
@@ -518,9 +521,10 @@ mod remote_tests {
 	#[tokio::test]
 	async fn can_create_state_snapshot() {
 		init_logger();
-		Builder::<Block>::new()
+		Builder::<'_, Block>::new()
 			.mode(Mode::Online(OnlineConfig {
 				state_snapshot: Some(SnapshotConfig::new("test_snapshot_to_remove.bin")),
+				modules: vec![ "Balances" ],
 				..Default::default()
 			}))
 			.build()
@@ -543,7 +547,7 @@ mod remote_tests {
 	}
 
 	#[tokio::test]
-	async fn can_build_all() {
+	async fn can_fetch_all() {
 		init_logger();
 		Builder::<Block>::new()
 			.build()
@@ -553,12 +557,24 @@ mod remote_tests {
 	}
 
 	#[tokio::test]
-	async fn paged_and_unsafe_are_equal() {
+	#[ignore]
+	async fn pagination_works() {
 		init_logger();
-		Builder::<Block>::new()
-			.build()
-			.await
-			.expect("Can't reach the remote node. Is it running?")
-			.execute_with(|| {});
+		let kv_paged = {
+			let mut builder = Builder::<Block>::new();
+			builder.init_remote_client().await.unwrap();
+			let at = builder
+				.as_online()
+				.at
+				.unwrap()
+				.clone();
+			builder.rpc_get_pairs_paged(StorageKey(vec![]), at).await.unwrap()
+		};
+
+		let _kv_unsafe = {
+			//
+		};
+
+		// TODO: would be good to complete this one.
 	}
 }
