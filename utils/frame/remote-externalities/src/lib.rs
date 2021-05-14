@@ -168,6 +168,12 @@ impl Clone for Transport<'_> {
 	}
 }
 
+impl<T: AsRef<str>> From<T> for Transport {
+	fn from(t: T) -> Self {
+		Self { uri: t, client: None }
+	}
+}
+
 /// Configuration of the online execution.
 ///
 /// A state snapshot config may be present and will be written to in that case.
