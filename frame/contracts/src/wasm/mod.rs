@@ -459,6 +459,12 @@ mod tests {
 			self.debug_buffer.extend(msg.as_bytes());
 			true
 		}
+		fn is_recursive(&self) -> bool {
+			false
+		}
+		fn is_executing(&self, _id: &AccountIdOf<Self::T>) -> bool {
+			false
+		}
 	}
 
 	fn execute<E: BorrowMut<MockExt>>(

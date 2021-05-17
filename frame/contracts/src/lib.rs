@@ -555,8 +555,8 @@ pub mod pallet {
 		/// on the call stack. Those actions are contract self destruction and restoration
 		/// of a tombstone.
 		ReentranceDenied,
-		/// `seal_input` was called twice from the same contract execution context.
-		InputAlreadyRead,
+		/// `seal_call` forwarded this contracts input. It therefore no longer available.
+		InputForwarded,
 		/// The subject passed to `seal_random` exceeds the limit.
 		RandomSubjectTooLong,
 		/// The amount of topics passed to `seal_deposit_events` exceeds the limit.

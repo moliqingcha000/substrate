@@ -325,6 +325,12 @@ pub trait Ext: sealing::Sealed {
 	///
 	/// Returns `true` if debug message recording is enabled. Otherwise `false` is returned.
 	fn append_debug_buffer(&mut self, msg: &str) -> bool;
+
+	/// Returns whether the current contract is on the stack multiple times.
+	fn is_recursive(&self) -> bool;
+
+	/// Returns whether a contract with the specified id is on the call stack.
+	fn is_executing(&self, id: &AccountIdOf<Self::T>) -> bool;
 }
 
 /// Describes the different functions that can be exported by an [`Executable`].
@@ -1012,12 +1018,6 @@ where
 			.rev()
 	}
 
-	/// Returns whether the current contract is on the stack multiple times.
-	fn is_recursive(&self) -> bool {
-		let account_id = &self.top_frame().account_id;
-		self.frames().skip(1).any(|f| &f.account_id == account_id)
-	}
-
 	/// Increments the cached account id and returns the value to be used for the trie_id.
 	fn next_trie_seed(&mut self) -> u64 {
 		let next = if let Some(current) = self.account_counter {
@@ -1100,9 +1100,6 @@ where
 		&mut self,
 		beneficiary: &AccountIdOf<Self::T>,
 	) -> Result<u32, (DispatchError, u32)> {
-		if self.is_recursive() {
-			return Err((Error::<T>::ReentranceDenied.into(), 0));
-		}
 		let frame = self.top_frame_mut();
 		let info = frame.terminate();
 		Storage::<T>::queue_trie_for_deletion(&info).map_err(|e| (e, 0))?;
@@ -1128,9 +1125,6 @@ where
 		rent_allowance: BalanceOf<Self::T>,
 		delta: Vec<StorageKey>,
 	) -> Result<(u32, u32), (DispatchError, u32, u32)> {
-		if self.is_recursive() {
-			return Err((Error::<T>::ReentranceDenied.into(), 0, 0));
-		}
 		let origin_contract = self.top_frame_mut().contract_info().clone();
 		let result = Rent::<T, E>::restore_to(
 			&self.top_frame().account_id,
@@ -1253,6 +1247,15 @@ where
 		} else {
 			false
 		}
+	}
+
+	fn is_recursive(&self) -> bool {
+		let account_id = &self.top_frame().account_id;
+		self.frames().skip(1).any(|f| &f.account_id == account_id)
+	}
+
+	fn is_executing(&self, id: &AccountIdOf<Self::T>) -> bool {
+		self.frames().any(|f| &f.account_id == id)
 	}
 }
 
